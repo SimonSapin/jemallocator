@@ -81,6 +81,7 @@ fn main() {
         cmd.arg("--disable-tls");
     } else if target.contains("android") {
         cmd.arg("--disable-tls");
+        cmd.arg("--with-malloc-conf=background_thread:false");
     }
 
     cmd.arg("--with-jemalloc-prefix=_rjem_");
