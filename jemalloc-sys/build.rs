@@ -15,9 +15,29 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+fn gnu_target(target: &str) -> String {
+    match target {
+        "i686-pc-windows-msvc" => "i686-pc-win32".to_string(),
+        "x86_64-pc-windows-msvc" => "x86_64-pc-win32".to_string(),
+        "i686-pc-windows-gnu" => "i686-w64-mingw32".to_string(),
+        "x86_64-pc-windows-gnu" => "x86_64-w64-mingw32".to_string(),
+        s => s.to_string(),
+    }
+}
+
 fn main() {
-    let target = env::var("TARGET").unwrap();
-    let host = env::var("HOST").unwrap();
+    let target = env::var("TARGET").expect("TARGET was not set");
+    let host = env::var("HOST").expect("HOST was not set");
+    let unsupported_targets = [
+        "rumprun", "bitrig", "openbsd", "msvc",
+        "emscripten", "fuchsia", "redox", "wasm32",
+    ];
+    for i in &unsupported_targets {
+        if target.contains(i) {
+            panic!("jemalloc does not support target: {}", target);
+        }
+    }
+
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let build_dir = out_dir.join("build");
     let src_dir = env::current_dir().unwrap();
@@ -39,18 +59,29 @@ fn main() {
     let cflags = compiler.args().iter().map(|s| s.to_str().unwrap())
                          .collect::<Vec<_>>().join(" ");
 
+
+    let configure = src_dir.join("jemalloc/configure");
     let mut cmd = Command::new("sh");
-    cmd.arg(src_dir.join("jemalloc/configure").to_str().unwrap()
+    cmd.arg(configure.to_str().unwrap()
                    .replace("C:\\", "/c/")
                    .replace("\\", "/"))
        .current_dir(&build_dir)
        .env("CC", compiler.path())
-       .env("CFLAGS", cflags);
+       .env("CFLAGS", cflags.clone())
+       .env("CPPFLAGS", cflags.clone())
+       .arg("--disable-cxx") ;
+
+    // jemalloc's configure doesn't detect this value
+    // automatically for this target:
+    if target == "sparc64-unknown-linux-gnu" {
+        cmd.arg("--with-lg-quantum=4");
+    }
 
     if target.contains("ios") {
         cmd.arg("--disable-tls");
     } else if target.contains("android") {
         cmd.arg("--disable-tls");
+        cmd.arg("--with-malloc-conf=background_thread:false");
     }
 
     cmd.arg("--with-jemalloc-prefix=_rjem_");
@@ -62,12 +93,21 @@ fn main() {
     if env::var_os("CARGO_FEATURE_PROFILING").is_some() {
         cmd.arg("--enable-prof");
     }
-    cmd.arg(format!("--host={}", target.replace("windows-gnu", "w64-mingw32")));
-    cmd.arg(format!("--build={}", host.replace("windows-gnu", "w64-mingw32")));
+    cmd.arg(format!("--host={}", gnu_target(&target)));
+    cmd.arg(format!("--build={}", gnu_target(&host)));
     cmd.arg(format!("--prefix={}", out_dir.display()));
 
     run(&mut cmd);
-    run(Command::new("make")
+
+    let make = if host.contains("bitrig") || host.contains("dragonfly") ||
+        host.contains("freebsd") || host.contains("netbsd") ||
+        host.contains("openbsd") {
+        "gmake"
+    } else {
+        "make"
+    };
+
+    run(Command::new(make)
                 .current_dir(&build_dir)
                 .arg("install_lib_static")
                 .arg("install_include")

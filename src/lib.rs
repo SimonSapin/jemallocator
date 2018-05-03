@@ -17,13 +17,14 @@
 
 #![feature(allocator_api)]
 #![deny(missing_docs)]
+#![no_std]
 
-extern crate jemalloc_sys as ffi;
+extern crate jemalloc_sys;
 extern crate libc;
 
-use std::mem;
-use std::ptr;
-use std::heap::{Alloc, Layout, Excess, CannotReallocInPlace, AllocErr, System};
+use core::mem;
+use core::ptr::{self, NonNull};
+use core::heap::{GlobalAlloc, Alloc, Layout, Opaque, Excess, CannotReallocInPlace, AllocErr};
 
 use libc::{c_int, c_void};
 
@@ -39,19 +40,22 @@ const MIN_ALIGN: usize = 8;
               target_arch = "x86_64",
               target_arch = "aarch64",
               target_arch = "powerpc64",
-              target_arch = "powerpc64le")))]
+              target_arch = "powerpc64le",
+              target_arch = "mips64",
+              target_arch = "s390x",
+              target_arch = "sparc64")))]
 const MIN_ALIGN: usize = 16;
 
-// MALLOCX_ALIGN(a) macro
-fn mallocx_align(a: usize) -> c_int {
-    a.trailing_zeros() as c_int
-}
-
-fn align_to_flags(align: usize) -> c_int {
-    if align <= MIN_ALIGN {
+fn layout_to_flags(align: usize, size: usize) -> c_int {
+    // If our alignment is less than the minimum alignment they we may not
+    // have to pass special flags asking for a higher alignment. If the
+    // alignment is greater than the size, however, then this hits a sort of odd
+    // case where we still need to ask for a custom alignment. See #25 for more
+    // info.
+    if align <= MIN_ALIGN && align <= size {
         0
     } else {
-        mallocx_align(align)
+        ffi::MALLOCX_ALIGN(align)
     }
 }
 
@@ -63,130 +67,96 @@ fn align_to_flags(align: usize) -> c_int {
 /// allocator.
 pub struct Jemalloc;
 
-unsafe impl Alloc for Jemalloc {
+unsafe impl GlobalAlloc for Jemalloc {
     #[inline]
-    unsafe fn alloc(&mut self, layout: Layout) -> Result<*mut u8, AllocErr> {
-        (&*self).alloc(layout)
-    }
-
-    #[inline]
-    unsafe fn alloc_zeroed(&mut self, layout: Layout)
-        -> Result<*mut u8, AllocErr>
-    {
-        (&*self).alloc_zeroed(layout)
-    }
-
-    #[inline]
-    unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
-        (&*self).dealloc(ptr, layout)
-    }
-
-    #[inline]
-    unsafe fn realloc(&mut self,
-                      ptr: *mut u8,
-                      old_layout: Layout,
-                      new_layout: Layout) -> Result<*mut u8, AllocErr> {
-        (&*self).realloc(ptr, old_layout, new_layout)
-    }
-
-    fn oom(&mut self, err: AllocErr) -> ! {
-        (&*self).oom(err)
-    }
-
-    #[inline]
-    fn usable_size(&self, layout: &Layout) -> (usize, usize) {
-        (&self).usable_size(layout)
-    }
-
-    #[inline]
-    unsafe fn alloc_excess(&mut self, layout: Layout) -> Result<Excess, AllocErr> {
-        (&*self).alloc_excess(layout)
-    }
-
-    #[inline]
-    unsafe fn realloc_excess(&mut self,
-                             ptr: *mut u8,
-                             layout: Layout,
-                             new_layout: Layout) -> Result<Excess, AllocErr> {
-        (&*self).realloc_excess(ptr, layout, new_layout)
-    }
-
-    #[inline]
-    unsafe fn grow_in_place(&mut self,
-                            ptr: *mut u8,
-                            layout: Layout,
-                            new_layout: Layout) -> Result<(), CannotReallocInPlace> {
-        (&*self).grow_in_place(ptr, layout, new_layout)
-    }
-
-    #[inline]
-    unsafe fn shrink_in_place(&mut self,
-                              ptr: *mut u8,
-                              layout: Layout,
-                              new_layout: Layout) -> Result<(), CannotReallocInPlace> {
-        (&*self).shrink_in_place(ptr, layout, new_layout)
-    }
-}
-
-unsafe impl<'a> Alloc for &'a Jemalloc {
-    #[inline]
-    unsafe fn alloc(&mut self, layout: Layout) -> Result<*mut u8, AllocErr> {
-        let flags = align_to_flags(layout.align());
+    unsafe fn alloc(&self, layout: Layout) -> *mut Opaque {
+        let flags = layout_to_flags(layout.align(), layout.size());
         let ptr = ffi::mallocx(layout.size(), flags);
-        if ptr.is_null() {
-            Err(AllocErr::Exhausted { request: layout })
-        } else {
-            Ok(ptr as *mut u8)
-        }
+        ptr as *mut Opaque
     }
 
     #[inline]
-    unsafe fn alloc_zeroed(&mut self, layout: Layout)
-        -> Result<*mut u8, AllocErr>
-    {
-        let ptr = if layout.align() <= MIN_ALIGN {
-            ffi::calloc(layout.size(), 1)
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut Opaque {
+        let ptr = if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
+            ffi::calloc(1, layout.size())
         } else {
-            let flags = align_to_flags(layout.align()) | ffi::MALLOCX_ZERO;
+            let flags = layout_to_flags(layout.align(), layout.size()) | ffi::MALLOCX_ZERO;
             ffi::mallocx(layout.size(), flags)
         };
-        if ptr.is_null() {
-            Err(AllocErr::Exhausted { request: layout })
-        } else {
-            Ok(ptr as *mut u8)
-        }
+        ptr as *mut Opaque
     }
 
     #[inline]
-    unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
-        let flags = align_to_flags(layout.align());
+    unsafe fn dealloc(&self, ptr: *mut Opaque, layout: Layout) {
+        let flags = layout_to_flags(layout.align(), layout.size());
         ffi::sdallocx(ptr as *mut c_void, layout.size(), flags)
     }
 
     #[inline]
+    unsafe fn realloc(&self,
+                      ptr: *mut Opaque,
+                      layout: Layout,
+                      new_size: usize) -> *mut Opaque {
+        let flags = layout_to_flags(layout.align(), new_size);
+        let ptr = ffi::rallocx(ptr as *mut c_void, new_size, flags);
+        ptr as *mut Opaque
+    }
+}
+
+unsafe impl Alloc for Jemalloc {
+    #[inline]
+    unsafe fn alloc(&mut self, layout: Layout) -> Result<NonNull<Opaque>, AllocErr> {
+        NonNull::new(GlobalAlloc::alloc(self, layout)).ok_or(AllocErr)
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&mut self, layout: Layout) -> Result<NonNull<Opaque>, AllocErr> {
+        NonNull::new(GlobalAlloc::alloc_zeroed(self, layout)).ok_or(AllocErr)
+    }
+
+    #[inline]
+    unsafe fn dealloc(&mut self, ptr: NonNull<Opaque>, layout: Layout) {
+        GlobalAlloc::dealloc(self, ptr.as_ptr(), layout)
+    }
+
+    #[inline]
     unsafe fn realloc(&mut self,
-                      ptr: *mut u8,
-                      old_layout: Layout,
-                      new_layout: Layout) -> Result<*mut u8, AllocErr> {
-        if old_layout.align() != new_layout.align() {
-            return Err(AllocErr::Unsupported { details: "cannot change align" })
-        }
-        let flags = align_to_flags(new_layout.align());
-        let ptr = ffi::rallocx(ptr as *mut c_void, new_layout.size(), flags);
-        if ptr.is_null() {
-            Err(AllocErr::Exhausted { request: new_layout })
+                      ptr: NonNull<Opaque>,
+                      layout: Layout,
+                      new_size: usize) -> Result<NonNull<Opaque>, AllocErr> {
+        NonNull::new(GlobalAlloc::realloc(self, ptr.as_ptr(), layout, new_size)).ok_or(AllocErr)
+    }
+
+    #[inline]
+    unsafe fn alloc_excess(&mut self, layout: Layout) -> Result<Excess, AllocErr> {
+        let flags = layout_to_flags(layout.align(), layout.size());
+        let ptr = ffi::mallocx(layout.size(), flags);
+        if let Some(nonnull) = NonNull::new(ptr as *mut Opaque) {
+            let excess = ffi::nallocx(layout.size(), flags);
+            Ok(Excess(nonnull, excess))
         } else {
-            Ok(ptr as *mut u8)
+            Err(AllocErr)
         }
     }
 
-    fn oom(&mut self, err: AllocErr) -> ! {
-        System.oom(err)
+    #[inline]
+    unsafe fn realloc_excess(&mut self,
+                      ptr: NonNull<Opaque>,
+                      layout: Layout,
+                      new_size: usize) -> Result<Excess, AllocErr> {
+        let flags = layout_to_flags(layout.align(), new_size);
+        let ptr = ffi::rallocx(ptr.cast().as_ptr(), new_size, flags);
+        if let Some(nonnull) = NonNull::new(ptr as *mut Opaque) {
+            let excess = ffi::nallocx(new_size, flags);
+            Ok(Excess(nonnull, excess))
+        } else {
+            Err(AllocErr)
+        }
     }
 
     #[inline]
     fn usable_size(&self, layout: &Layout) -> (usize, usize) {
-        let flags = align_to_flags(layout.align());
+        let flags = layout_to_flags(layout.align(), layout.size());
         unsafe {
             let max = ffi::nallocx(layout.size(), flags);
             (layout.size(), max)
@@ -195,28 +165,41 @@ unsafe impl<'a> Alloc for &'a Jemalloc {
 
     #[inline]
     unsafe fn grow_in_place(&mut self,
-                            ptr: *mut u8,
-                            old_layout: Layout,
-                            new_layout: Layout) -> Result<(), CannotReallocInPlace> {
-        self.shrink_in_place(ptr, old_layout, new_layout)
+                            ptr: NonNull<Opaque>,
+                            layout: Layout,
+                            new_size: usize) -> Result<(), CannotReallocInPlace> {
+        self.shrink_in_place(ptr, layout, new_size)
     }
 
     #[inline]
     unsafe fn shrink_in_place(&mut self,
-                              ptr: *mut u8,
-                              old_layout: Layout,
-                              new_layout: Layout) -> Result<(), CannotReallocInPlace> {
-        if old_layout.align() != new_layout.align() {
-            return Err(CannotReallocInPlace)
-        }
-        let flags = align_to_flags(new_layout.align());
-        let size = ffi::xallocx(ptr as *mut c_void, new_layout.size(), 0, flags);
-        if size >= new_layout.size() {
+                              ptr: NonNull<Opaque>,
+                              layout: Layout,
+                              new_size: usize) -> Result<(), CannotReallocInPlace> {
+        let flags = layout_to_flags(layout.align(), new_size);
+        let size = ffi::xallocx(ptr.cast().as_ptr(), new_size, 0, flags);
+        if size >= new_size {
             Err(CannotReallocInPlace)
         } else {
             Ok(())
         }
     }
+}
+
+/// Return the usable size of the allocation pointed to by ptr.
+///
+/// The return value may be larger than the size that was requested during allocation.
+/// This function is not a mechanism for in-place `realloc()`;
+/// rather it is provided solely as a tool for introspection purposes.
+/// Any discrepancy between the requested allocation size
+/// and the size reported by this function should not be depended on,
+/// since such behavior is entirely implementation-dependent.
+///
+/// # Unsafety
+///
+/// `ptr` must have been allocated by `Jemalloc` and must not have been freed yet.
+pub unsafe fn usable_size<T>(ptr: *const T) -> usize {
+    ffi::malloc_usable_size(ptr as *const c_void)
 }
 
 /// Fetch the value of options `name`.
@@ -260,4 +243,9 @@ pub unsafe fn mallctl_set<T>(name: &[u8], mut t: T) -> Result<(), i32> {
         return Err(code);
     }
     Ok(())
+}
+
+/// Raw bindings to jemalloc
+pub mod ffi {
+    pub use jemalloc_sys::*;
 }
